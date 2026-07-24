@@ -3,8 +3,13 @@ import type { ContentfulStatusCode } from "hono/utils/http-status";
 import { hasPermission } from "@abeltib/lookup-core";
 import { AppError, ERROR_CODES, PERMISSIONS } from "@abeltib/lookup-shared";
 import { internalAuth, type AuthVariables } from "./middleware/internal-auth.js";
+import { requestLogger } from "./middleware/request-logger.js";
 
 const app = new Hono<{ Variables: AuthVariables }>();
+
+// Outermost middleware — logs every request, authenticated or not,
+// including ones internalAuth rejects with a 401 (§"nothing left untraced").
+app.use("*", requestLogger);
 
 // No auth required — used by Cloudflare/uptime checks.
 app.get("/health", (c) => c.json({ status: "ok" }));
