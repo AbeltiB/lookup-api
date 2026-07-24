@@ -1,0 +1,15 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "lookup-api",
+  "main": "src/index.ts",
+  "compatibility_date": "2026-07-24",
+  // Required for @abeltib/lookup-core: it reads secrets via plain
+  // process.env.X (same code path used by lookup-web on Node.js) rather
+  // than threading Workers' `env` bindings through every function. The
+  // nodejs_compat flag makes Workers populate process.env from bindings
+  // for the current request, so that code runs unmodified here too.
+  "compatibility_flags": ["nodejs_compat"],
+  "observability": {
+    "enabled": true
+  }
+}

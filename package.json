@@ -1,19 +1,33 @@
 {
   "name": "lookup-api",
   "version": "1.0.0",
-  "description": "",
-  "main": "index.js",
+  "description": "Lookup orchestration, provider routing, and webhook service — Hono on Cloudflare Workers.",
+  "type": "module",
+  "license": "UNLICENSED",
   "scripts": {
-    "test": "echo \"Error: no test specified\" && exit 1"
+    "dev": "wrangler dev",
+    "deploy": "wrangler deploy",
+    "typecheck": "tsc --noEmit",
+    "lint": "eslint .",
+    "cf-typegen": "wrangler types"
+  },
+  "dependencies": {
+    "@abeltib/lookup-core": "file:../lookup-core",
+    "@abeltib/lookup-shared": "file:../lookup-shared",
+    "hono": "^4.12.31"
+  },
+  "devDependencies": {
+    "@cloudflare/workers-types": "^5.20260724.1",
+    "@eslint/js": "^10.0.1",
+    "eslint": "^10.7.0",
+    "typescript": "^5.9.0",
+    "typescript-eslint": "^8.65.0",
+    "wrangler": "^4.114.0"
   },
   "repository": {
     "type": "git",
     "url": "git+https://github.com/AbeltiB/lookup-api.git"
   },
-  "keywords": [],
-  "author": "",
-  "license": "ISC",
-  "type": "commonjs",
   "bugs": {
     "url": "https://github.com/AbeltiB/lookup-api/issues"
   },

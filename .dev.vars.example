@@ -1,0 +1,4 @@
+# Copy to .dev.vars for local `wrangler dev` (gitignored). In production,
+# set these with `wrangler secret put <NAME>` instead — never in wrangler.jsonc.
+DATABASE_URL="postgresql://user:password@ep-example-pooler.region.aws.neon.tech/lookup?sslmode=require"
+INTERNAL_JWT_SECRET="generate-with-openssl-rand-base64-32"
