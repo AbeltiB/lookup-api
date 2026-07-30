@@ -2,3 +2,16 @@
 # set these with `wrangler secret put <NAME>` instead — never in wrangler.jsonc.
 DATABASE_URL="postgresql://user:password@ep-example-pooler.region.aws.neon.tech/lookup?sslmode=require"
 INTERNAL_JWT_SECRET="generate-with-openssl-rand-base64-32"
+
+# Telegram (@BotFather) — same bot token as lookup-web/lookup-core's copy,
+# backs the chat-based lookup bot (telegram-bot.ts).
+TELEGRAM_BOT_TOKEN="generate-from-botfather"
+# Set when registering the webhook with Telegram (setWebhook's secret_token
+# param) — compared against the X-Telegram-Bot-Api-Secret-Token header on
+# every incoming update. Any random string; doesn't need to match anything else.
+TELEGRAM_WEBHOOK_SECRET="generate-with-openssl-rand-base64-32"
+# Pre-seeds this Telegram numeric user ID as SUPER_ADMIN on first login —
+# must match lookup-web/lookup-core's copy.
+SUPER_ADMIN_TELEGRAM_ID=""
+# Used to build links back to the dashboard (buy-credits, history) from bot replies.
+WEB_APP_URL="http://localhost:3000"

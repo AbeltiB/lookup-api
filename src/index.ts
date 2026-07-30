@@ -4,6 +4,7 @@ import { hasPermission } from "@abeltib/lookup-core";
 import { AppError, ERROR_CODES, PERMISSIONS } from "@abeltib/lookup-shared";
 import { internalAuth, type AuthVariables } from "./middleware/internal-auth.js";
 import { requestLogger } from "./middleware/request-logger.js";
+import { getTelegramWebhookHandler } from "./telegram-bot.js";
 
 const app = new Hono<{ Variables: AuthVariables }>();
 
@@ -13,6 +14,11 @@ app.use("*", requestLogger);
 
 // No auth required — used by Cloudflare/uptime checks.
 app.get("/health", (c) => c.json({ status: "ok" }));
+
+// Public — Telegram calls this directly. Verified via the
+// X-Telegram-Bot-Api-Secret-Token header (grammY's webhookCallback),
+// not the internalAuth JWT middleware below.
+app.post("/telegram/webhook", (c) => getTelegramWebhookHandler()(c));
 
 const v1 = new Hono<{ Variables: AuthVariables }>();
 v1.use("*", internalAuth);

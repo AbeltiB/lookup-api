@@ -14,11 +14,13 @@
   "dependencies": {
     "@abeltib/lookup-core": "file:../lookup-core",
     "@abeltib/lookup-shared": "file:../lookup-shared",
+    "grammy": "^1.45.1",
     "hono": "^4.12.31"
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20260724.1",
     "@eslint/js": "^10.0.1",
+    "@types/node": "^26.1.2",
     "eslint": "^10.7.0",
     "typescript": "^5.9.0",
     "typescript-eslint": "^8.65.0",
