@@ -9,7 +9,8 @@
     "deploy": "wrangler deploy",
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
-    "cf-typegen": "wrangler types"
+    "cf-typegen": "wrangler types",
+    "postinstall": "prisma generate --schema=./node_modules/@abeltib/lookup-core/prisma/schema.prisma"
   },
   "dependencies": {
     "@abeltib/lookup-core": "^0.1.0",
@@ -22,6 +23,7 @@
     "@eslint/js": "^10.0.1",
     "@types/node": "^26.1.2",
     "eslint": "^10.7.0",
+    "prisma": "^7.9.0",
     "typescript": "^5.9.0",
     "typescript-eslint": "^8.65.0",
     "wrangler": "^4.114.0"
