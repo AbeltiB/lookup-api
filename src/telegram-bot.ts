@@ -1,5 +1,5 @@
 import crypto from "node:crypto";
-import { Bot, Keyboard, webhookCallback } from "grammy";
+import { Bot, Keyboard, InlineKeyboard, webhookCallback } from "grammy";
 import type { Context } from "hono";
 import {
   prisma,
@@ -42,6 +42,16 @@ const SHARE_PHONE_KEYBOARD = new Keyboard().requestContact("📱 Share my phone 
 
 function webAppUrl(): string {
   return process.env.WEB_APP_URL || "http://localhost:3000";
+}
+
+/** The Mini App's URL — same origin as the web dashboard, under /miniapp (see lookup-web/src/app/miniapp/). Trims any trailing slash on WEB_APP_URL first so this never ends up with a doubled "//miniapp". */
+function miniAppUrl(): string {
+  return `${webAppUrl().replace(/\/+$/, "")}/miniapp`;
+}
+
+/** Computed lazily (not a module-level constant) — same reasoning as getBot() reading TELEGRAM_BOT_TOKEN inside the function body: env bindings aren't guaranteed available at bare module-evaluation time on Workers. */
+function openAppKeyboard(): InlineKeyboard {
+  return new InlineKeyboard().webApp("📱 Open App", miniAppUrl());
 }
 
 async function requireUser(telegramFrom: { id: number; first_name: string; last_name?: string; username?: string } | undefined) {
@@ -134,12 +144,13 @@ function getBot(): Bot {
     }
 
     await ctx.reply(
-      `Welcome to DeviceIQ, ${user.name}!\n\nSend me an IMEI or serial number to check it.\n\n` +
+      `Welcome to DeviceIQ, ${user.name}!\n\nSend me an IMEI or serial number to check it, or open the app below for a full dashboard — balance, services, history, and deposits.\n\n` +
         "/services — see what's available and their codes\n" +
         "/package — bundle several checks into one report\n" +
         "/balance — your credit balance\n" +
         "/history — your last few checks\n" +
         "/settings — how to pick a specific service per check",
+      { reply_markup: openAppKeyboard() },
     );
 
     if (!user.phoneNumber) {
@@ -148,6 +159,12 @@ function getBot(): Bot {
         { reply_markup: SHARE_PHONE_KEYBOARD },
       );
     }
+  });
+
+  bot.command("app", async (ctx) => {
+    const user = await requireUser(ctx.from);
+    if (!user) return;
+    await ctx.reply("Open the DeviceIQ app for your balance, services, history, and deposits:", { reply_markup: openAppKeyboard() });
   });
 
   bot.on("message:contact", async (ctx) => {
