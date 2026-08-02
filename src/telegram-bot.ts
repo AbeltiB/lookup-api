@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import { Bot, Keyboard, webhookCallback } from "grammy";
 import type { Context } from "hono";
-import { prisma, findOrCreateUserByTelegramId, getWalletBalance, getLookupHistory, submitLookup } from "@abeltib/lookup-core/workerd";
+import { prisma, findOrCreateUserByTelegramId, getWalletBalance, getLookupHistory, submitLookup, confirmTelegramLoginSession } from "@abeltib/lookup-core/workerd";
 import { isValidImei, isPlausibleSerial, normalizeImei } from "@abeltib/lookup-shared";
 
 /**
@@ -66,8 +66,37 @@ function getBot(): Bot {
   bot = new Bot(token);
 
   bot.command("start", async (ctx) => {
-    const user = await requireUser(ctx.from);
+    const telegramFrom = ctx.from;
+    if (!telegramFrom) return;
+
+    // Resolved/created up front regardless of the branch below, so a first-
+    // ever /start via a login deep link still creates their account, same
+    // as a bare /start would.
+    const user = await requireUser(telegramFrom);
     if (!user) return;
+
+    // `t.me/<bot>?start=<token>` deep links arrive as "/start <token>" —
+    // ctx.match is grammY's parsed payload after the command. This is the
+    // verify.et-style web login flow (lookup-web/telegram-login-session.ts):
+    // no phone number, ever, unlike the Telegram Login Widget's
+    // oauth.telegram.org fallback. A bare /start (organic bot discovery)
+    // has an empty match and falls through to the normal welcome message.
+    const loginToken = ctx.match?.trim();
+    if (loginToken) {
+      const confirmed = await confirmTelegramLoginSession(loginToken, {
+        telegramId: String(telegramFrom.id),
+        firstName: user.firstName,
+        lastName: user.lastName || undefined,
+        username: user.telegramUsername ?? undefined,
+      });
+      await ctx.reply(
+        confirmed
+          ? "✅ You're logged in on DeviceIQ! You can close Telegram and go back to your browser."
+          : "That login link has expired or was already used — go back to the website and try again.",
+      );
+      return;
+    }
+
     await ctx.reply(
       `Welcome to DeviceIQ, ${user.name}!\n\nSend me an IMEI or serial number to check it.\n\n` +
         "/services — see what's available and their codes\n" +
