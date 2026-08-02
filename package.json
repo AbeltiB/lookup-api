@@ -13,7 +13,7 @@
     "postinstall": "prisma generate --schema=./node_modules/@abeltib/lookup-core/prisma/schema.prisma --generator=client_workerd"
   },
   "dependencies": {
-    "@abeltib/lookup-core": "^0.1.8",
+    "@abeltib/lookup-core": "^0.1.9",
     "@abeltib/lookup-shared": "^0.1.2",
     "grammy": "^1.45.1",
     "hono": "^4.12.31"
