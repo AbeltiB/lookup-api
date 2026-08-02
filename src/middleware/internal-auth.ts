@@ -1,5 +1,5 @@
 import { createMiddleware } from "hono/factory";
-import { verifyInternalJwt } from "@abeltib/lookup-core";
+import { verifyInternalJwt } from "@abeltib/lookup-core/workerd";
 import { ERROR_CODES, type InternalJwtPayload } from "@abeltib/lookup-shared";
 
 export type AuthVariables = { auth: InternalJwtPayload };

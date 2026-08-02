@@ -1,6 +1,6 @@
 import { Hono } from "hono";
 import type { ContentfulStatusCode } from "hono/utils/http-status";
-import { hasPermission } from "@abeltib/lookup-core";
+import { hasPermission } from "@abeltib/lookup-core/workerd";
 import { AppError, ERROR_CODES, PERMISSIONS } from "@abeltib/lookup-shared";
 import { internalAuth, type AuthVariables } from "./middleware/internal-auth.js";
 import { requestLogger } from "./middleware/request-logger.js";

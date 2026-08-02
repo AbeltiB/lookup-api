@@ -1,7 +1,7 @@
 import crypto from "node:crypto";
 import { Bot, Keyboard, webhookCallback } from "grammy";
 import type { Context } from "hono";
-import { prisma, findOrCreateUserByTelegramId, getWalletBalance, getLookupHistory, submitLookup } from "@abeltib/lookup-core";
+import { prisma, findOrCreateUserByTelegramId, getWalletBalance, getLookupHistory, submitLookup } from "@abeltib/lookup-core/workerd";
 import { isValidImei, isPlausibleSerial, normalizeImei } from "@abeltib/lookup-shared";
 
 /**

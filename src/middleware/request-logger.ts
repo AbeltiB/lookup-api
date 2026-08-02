@@ -1,5 +1,5 @@
 import { createMiddleware } from "hono/factory";
-import { logHttpEvent } from "@abeltib/lookup-core";
+import { logHttpEvent } from "@abeltib/lookup-core/workerd";
 import type { AuthVariables } from "./internal-auth.js";
 
 /**
