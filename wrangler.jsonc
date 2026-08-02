@@ -3,6 +3,10 @@
   "name": "lookup-api",
   "main": "src/index.ts",
   "compatibility_date": "2026-07-24",
+  // Explicit so `wrangler deploy` never needs to ask interactively — the
+  // account already has a workers.dev subdomain; this just opts this
+  // specific Worker into it, at https://lookup-api.<subdomain>.workers.dev.
+  "workers_dev": true,
   // Required for @abeltib/lookup-core: it reads secrets via plain
   // process.env.X (same code path used by lookup-web on Node.js) rather
   // than threading Workers' `env` bindings through every function. The
