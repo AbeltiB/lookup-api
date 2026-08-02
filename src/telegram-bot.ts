@@ -1,6 +1,7 @@
 import crypto from "node:crypto";
 import { Bot, Keyboard, InlineKeyboard, webhookCallback } from "grammy";
-import type { Context } from "hono";
+import type { Context as GrammyContext } from "grammy";
+import type { Context as HonoContext } from "hono";
 import {
   prisma,
   findOrCreateUserByTelegramId,
@@ -34,6 +35,24 @@ import { isValidImei, isPlausibleSerial, normalizeImei, formatLookupResultFields
  * package code first, then as a single service code, since both are
  * unique uppercase-snake identifiers and never legally collide.
  * /services lists service codes, /package lists package codes.
+ *
+ * Group support: the same identifier-parsing/run logic works when the bot
+ * is added to a group, but the *delivery* differs — a group is a shared,
+ * semi-public space, so the actual result (device details, blacklist
+ * status, etc.) is never posted there. Only a short "checked, sent to your
+ * DMs" acknowledgment goes in the group; the real result is DMed to
+ * whoever sent it. This requires that person to have already started a
+ * private chat with the bot at least once — Telegram forbids a bot from
+ * DMing someone cold — so a failed DM in the group flow falls back to a
+ * "start a chat with me first" prompt with a deep link, rather than
+ * silently losing the result.
+ *
+ * Note: recognizing a *bare* IMEI/serial (not a "/command") in a group
+ * requires the bot's Privacy Mode to be OFF (set once via @BotFather →
+ * /setprivacy → Disable for this bot) — Telegram's platform-level
+ * default only delivers commands and @mentions to a bot in a group,
+ * nothing else. /check works in groups either way, since real slash
+ * commands are always delivered regardless of privacy mode.
  */
 
 const DEFAULT_SERVICE_CODE = "BASIC_INFO";
@@ -52,6 +71,155 @@ function miniAppUrl(): string {
 /** Computed lazily (not a module-level constant) — same reasoning as getBot() reading TELEGRAM_BOT_TOKEN inside the function body: env bindings aren't guaranteed available at bare module-evaluation time on Workers. */
 function openAppKeyboard(): InlineKeyboard {
   return new InlineKeyboard().webApp("📱 Open App", miniAppUrl());
+}
+
+type TelegramFrom = { id: number; first_name: string; last_name?: string; username?: string };
+
+function displayName(from: TelegramFrom): string {
+  return from.username ? `@${from.username}` : from.first_name;
+}
+
+/** Masks all but the first/last 4 characters — the group ack names the check without publishing the full identifier to a shared space. */
+function maskIdentifier(identifier: string): string {
+  if (identifier.length <= 8) return identifier;
+  return `${identifier.slice(0, 4)}${"•".repeat(identifier.length - 8)}${identifier.slice(-4)}`;
+}
+
+function startChatKeyboard(): InlineKeyboard | undefined {
+  const username = process.env.TELEGRAM_BOT_USERNAME;
+  return username ? new InlineKeyboard().url("Start a chat with me", `https://t.me/${username}`) : undefined;
+}
+
+/** Best-effort DM — returns false (never throws) on the extremely common "bot can't initiate conversation with user" case, which just means this person has never opened a DM with the bot before. */
+async function tryDm(ctx: GrammyContext, userId: number, text: string): Promise<boolean> {
+  try {
+    await ctx.api.sendMessage(userId, text);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+interface ParsedIdentifier {
+  explicitCode: string | null;
+  identifier: string;
+  identifierType: "IMEI" | "SERIAL";
+}
+
+function parseIdentifierMessage(text: string): ParsedIdentifier | null {
+  const trimmed = text.trim();
+  const parts = trimmed.split(/\s+/);
+  let explicitCode: string | null = null;
+  let rawIdentifier = trimmed;
+  if (parts.length >= 2 && /^[A-Z0-9_]+$/.test(parts[0] ?? "")) {
+    explicitCode = parts[0] as string;
+    rawIdentifier = parts.slice(1).join(" ");
+  }
+
+  const normalized = normalizeImei(rawIdentifier);
+  if (isValidImei(normalized)) return { explicitCode, identifier: normalized, identifierType: "IMEI" };
+  if (isPlausibleSerial(rawIdentifier)) return { explicitCode, identifier: rawIdentifier, identifierType: "SERIAL" };
+  return null;
+}
+
+/** Runs the actual check (single service or package, explicit code or the user's standing default) — identical whether the request came from a DM or a group, only the reply/delivery mechanics differ (see handleIdentifierRequest). */
+async function runIdentifierCheck(userId: string, parsed: ParsedIdentifier): Promise<string> {
+  if (parsed.explicitCode) {
+    // Try as a package code first — packages and services are both unique,
+    // uppercase-snake identifiers, so a code is never ambiguous between the two.
+    const pkg = await prisma.lookupPackage.findUnique({ where: { code: parsed.explicitCode } });
+    if (pkg) {
+      const result = await submitPackageLookup({
+        userId,
+        identifier: parsed.identifier,
+        identifierType: parsed.identifierType,
+        packageCode: parsed.explicitCode,
+        idempotencyKey: crypto.randomUUID(),
+      });
+      return formatPackageResult(result);
+    }
+    const result = await submitLookup({
+      userId,
+      identifier: parsed.identifier,
+      identifierType: parsed.identifierType,
+      serviceCode: parsed.explicitCode,
+      idempotencyKey: crypto.randomUUID(),
+    });
+    return formatLookupResult(result);
+  }
+
+  const defaultPackage = await getUserDefaultLookupPackage(userId);
+  if (defaultPackage) {
+    const result = await submitPackageLookup({
+      userId,
+      identifier: parsed.identifier,
+      identifierType: parsed.identifierType,
+      packageCode: defaultPackage.code,
+      idempotencyKey: crypto.randomUUID(),
+    });
+    return formatPackageResult(result);
+  }
+
+  const result = await submitLookup({
+    userId,
+    identifier: parsed.identifier,
+    identifierType: parsed.identifierType,
+    serviceCode: DEFAULT_SERVICE_CODE,
+    idempotencyKey: crypto.randomUUID(),
+  });
+  return formatLookupResult(result);
+}
+
+/**
+ * The one place DM vs. group delivery is decided. DMs reply inline, as
+ * always. In a group: never post the result itself — DM it, and leave
+ * only a short, masked-identifier acknowledgment in the group (or a
+ * "start a chat with me" prompt if the DM couldn't be delivered).
+ */
+async function handleIdentifierRequest(ctx: GrammyContext, telegramFrom: TelegramFrom, rawText: string): Promise<void> {
+  const isGroup = ctx.chat?.type === "group" || ctx.chat?.type === "supergroup";
+  const parsed = parseIdentifierMessage(rawText);
+  if (!parsed) {
+    // In a group, silent — most group chatter isn't a check request, and
+    // replying to every unrelated message would be spam. In a DM, this is
+    // the only signal the user gets that their input wasn't understood.
+    if (!isGroup) {
+      await ctx.reply("That doesn't look like a valid IMEI or serial number. Send just the identifier, or \"<code> <identifier>\".");
+    }
+    return;
+  }
+
+  const user = await requireUser(telegramFrom);
+  if (!user) return;
+
+  try {
+    const replyText = await runIdentifierCheck(user.id, parsed);
+    if (!isGroup) {
+      await ctx.reply(replyText);
+      return;
+    }
+
+    const delivered = await tryDm(ctx, telegramFrom.id, replyText);
+    await ctx.reply(
+      delivered
+        ? `🔍 Checked ${maskIdentifier(parsed.identifier)} for ${displayName(telegramFrom)} — result sent to your DMs.`
+        : `⚠️ ${displayName(telegramFrom)}, I checked ${maskIdentifier(parsed.identifier)} but couldn't DM you the result — please start a chat with me first, then try again.`,
+      delivered ? undefined : { reply_markup: startChatKeyboard() },
+    );
+  } catch (error) {
+    const message = error instanceof Error ? error.message : "Something went wrong — please try again.";
+    if (!isGroup) {
+      await ctx.reply(message);
+      return;
+    }
+    const delivered = await tryDm(ctx, telegramFrom.id, `❌ ${message}`);
+    await ctx.reply(
+      delivered
+        ? `⚠️ ${displayName(telegramFrom)}, that check couldn't be completed — details sent to your DMs.`
+        : `⚠️ ${displayName(telegramFrom)}, that check couldn't be completed, and I couldn't DM you either — please start a chat with me first.`,
+      delivered ? undefined : { reply_markup: startChatKeyboard() },
+    );
+  }
 }
 
 async function requireUser(telegramFrom: { id: number; first_name: string; last_name?: string; username?: string } | undefined) {
@@ -200,7 +368,10 @@ function getBot(): Bot {
       return;
     }
     const lines = services.map((s) => `• ${s.name} — ${s.creditCost} credit(s) (code: ${s.code})`);
-    await ctx.reply(`Available services:\n${lines.join("\n")}\n\nSend a bare IMEI/serial for ${DEFAULT_SERVICE_CODE} (or your /package default, if set), or "<code> <identifier>" for a specific one.`);
+    await ctx.reply(
+      `Available services:\n${lines.join("\n")}\n\nSend a bare IMEI/serial for ${DEFAULT_SERVICE_CODE} (or your /package default, if set), or "<code> <identifier>" for a specific one.\n\n` +
+        "Works in groups too — add me and send an IMEI (or use /check <identifier>). Results always go to your DMs, never posted in the group.",
+    );
   });
 
   bot.command("history", async (ctx) => {
@@ -263,66 +434,36 @@ function getBot(): Bot {
     }
   });
 
+  // Privacy-mode-independent group entry point (see the file-level doc
+  // comment) — real slash commands are always delivered to the bot in a
+  // group even with Privacy Mode on, unlike bare text.
+  bot.command("check", async (ctx) => {
+    const telegramFrom = ctx.from;
+    if (!telegramFrom) return;
+    const arg = ctx.match?.trim();
+    if (!arg) {
+      await ctx.reply('Usage: /check <identifier>, or "/check <code> <identifier>" for a specific service or package.');
+      return;
+    }
+    await handleIdentifierRequest(ctx, telegramFrom, arg);
+  });
+
   bot.on("message:text", async (ctx) => {
     const text = ctx.message.text.trim();
     if (text.startsWith("/")) return; // unrecognized command — grammY's command handlers above already caught known ones
 
-    const user = await requireUser(ctx.from);
-    if (!user) return;
-
-    const parts = text.split(/\s+/);
-    let explicitCode: string | null = null;
-    let rawIdentifier = text;
-    if (parts.length >= 2 && /^[A-Z0-9_]+$/.test(parts[0] ?? "")) {
-      explicitCode = parts[0] as string;
-      rawIdentifier = parts.slice(1).join(" ");
-    }
-
-    const normalized = normalizeImei(rawIdentifier);
-    const identifierType = isValidImei(normalized) ? "IMEI" : isPlausibleSerial(rawIdentifier) ? "SERIAL" : null;
-    if (!identifierType) {
-      await ctx.reply("That doesn't look like a valid IMEI or serial number. Send just the identifier, or \"<code> <identifier>\".");
-      return;
-    }
-    const identifier = identifierType === "IMEI" ? normalized : rawIdentifier;
-
-    try {
-      if (explicitCode) {
-        // Try as a package code first — packages and services are both
-        // unique, uppercase-snake identifiers, so a code is never
-        // ambiguous between the two.
-        const pkg = await prisma.lookupPackage.findUnique({ where: { code: explicitCode } });
-        if (pkg) {
-          const result = await submitPackageLookup({ userId: user.id, identifier, identifierType, packageCode: explicitCode, idempotencyKey: crypto.randomUUID() });
-          await ctx.reply(formatPackageResult(result));
-          return;
-        }
-        const result = await submitLookup({ userId: user.id, identifier, identifierType, serviceCode: explicitCode, idempotencyKey: crypto.randomUUID() });
-        await ctx.reply(formatLookupResult(result));
-        return;
-      }
-
-      const defaultPackage = await getUserDefaultLookupPackage(user.id);
-      if (defaultPackage) {
-        const result = await submitPackageLookup({ userId: user.id, identifier, identifierType, packageCode: defaultPackage.code, idempotencyKey: crypto.randomUUID() });
-        await ctx.reply(formatPackageResult(result));
-        return;
-      }
-
-      const result = await submitLookup({ userId: user.id, identifier, identifierType, serviceCode: DEFAULT_SERVICE_CODE, idempotencyKey: crypto.randomUUID() });
-      await ctx.reply(formatLookupResult(result));
-    } catch (error) {
-      await ctx.reply(error instanceof Error ? error.message : "Something went wrong — please try again.");
-    }
+    const telegramFrom = ctx.from;
+    if (!telegramFrom) return;
+    await handleIdentifierRequest(ctx, telegramFrom, text);
   });
 
   return bot;
 }
 
-let webhookHandler: ((c: Context) => Promise<Response>) | undefined;
+let webhookHandler: ((c: HonoContext) => Promise<Response>) | undefined;
 
 /** Lazily builds the bot + wraps it once with grammY's Hono adapter (handles the X-Telegram-Bot-Api-Secret-Token check for us). */
-export function getTelegramWebhookHandler(): (c: Context) => Promise<Response> {
+export function getTelegramWebhookHandler(): (c: HonoContext) => Promise<Response> {
   if (webhookHandler) return webhookHandler;
   webhookHandler = webhookCallback(getBot(), "hono", { secretToken: process.env.TELEGRAM_WEBHOOK_SECRET });
   return webhookHandler;
