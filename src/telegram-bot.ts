@@ -1,7 +1,18 @@
 import crypto from "node:crypto";
 import { Bot, Keyboard, webhookCallback } from "grammy";
 import type { Context } from "hono";
-import { prisma, findOrCreateUserByTelegramId, getWalletBalance, getLookupHistory, submitLookup, confirmTelegramLoginSession } from "@abeltib/lookup-core/workerd";
+import {
+  prisma,
+  findOrCreateUserByTelegramId,
+  getWalletBalance,
+  getLookupHistory,
+  submitLookup,
+  confirmTelegramLoginSession,
+  submitPackageLookup,
+  listActiveLookupPackages,
+  setUserDefaultLookupPackage,
+  getUserDefaultLookupPackage,
+} from "@abeltib/lookup-core/workerd";
 import { isValidImei, isPlausibleSerial, normalizeImei } from "@abeltib/lookup-shared";
 
 /**
@@ -16,10 +27,13 @@ import { isValidImei, isPlausibleSerial, normalizeImei } from "@abeltib/lookup-s
  * proof-of-payment flow doesn't translate to a chat interface. The bot
  * points to the web dashboard's Buy Credits page instead.
  *
- * No persisted "default service" preference yet (would need a schema
- * change) — bare IMEI/serial messages always run BASIC_INFO; send
- * "<SERVICE_CODE> <identifier>" for anything else. /services lists the
- * codes.
+ * Bare IMEI/serial messages run the user's standing package default
+ * (User.defaultLookupPackageId, set via /package) once they've chosen
+ * one; until then they still just run BASIC_INFO, unchanged. Either way,
+ * "<CODE> <identifier>" overrides for one message — CODE is tried as a
+ * package code first, then as a single service code, since both are
+ * unique uppercase-snake identifiers and never legally collide.
+ * /services lists service codes, /package lists package codes.
  */
 
 const DEFAULT_SERVICE_CODE = "BASIC_INFO";
@@ -53,6 +67,28 @@ function formatLookupResult(result: Awaited<ReturnType<typeof submitLookup>>): s
     return `No record found (${result.creditsCharged} credit(s) charged).`;
   }
   return `❌ ${result.errorMessage ?? "That check failed — any credits charged were refunded."}`;
+}
+
+function formatPackageResult(result: Awaited<ReturnType<typeof submitPackageLookup>>): string {
+  if (result.status === "PROCESSING") {
+    return `Still checking with the provider on part of "${result.packageName}" — I'll have a full answer soon; check /history shortly.`;
+  }
+  if (result.status === "FAILED") {
+    return `❌ "${result.packageName}" couldn't be completed — any credits charged were refunded.`;
+  }
+
+  const blocks = result.items.map((item) => {
+    if (item.status === "SUCCEEDED") {
+      const data = (item.resultJson ?? {}) as Record<string, unknown>;
+      const lines = Object.entries(data).map(([key, value]) => `  ${key}: ${value}`);
+      return `✅ ${item.serviceCode}\n${lines.join("\n")}`;
+    }
+    if (item.status === "NOT_FOUND") return `— ${item.serviceCode}: no record found`;
+    if (item.status === "PROCESSING") return `⏳ ${item.serviceCode}: still checking`;
+    return `❌ ${item.serviceCode}: ${item.errorMessage ?? "failed"}`;
+  });
+
+  return `📦 ${result.packageName} (${result.creditsCharged} credit(s) charged)\n\n${blocks.join("\n\n")}`;
 }
 
 let bot: Bot | undefined;
@@ -100,6 +136,7 @@ function getBot(): Bot {
     await ctx.reply(
       `Welcome to DeviceIQ, ${user.name}!\n\nSend me an IMEI or serial number to check it.\n\n` +
         "/services — see what's available and their codes\n" +
+        "/package — bundle several checks into one report\n" +
         "/balance — your credit balance\n" +
         "/history — your last few checks\n" +
         "/settings — how to pick a specific service per check",
@@ -146,7 +183,7 @@ function getBot(): Bot {
       return;
     }
     const lines = services.map((s) => `• ${s.name} — ${s.creditCost} credit(s) (code: ${s.code})`);
-    await ctx.reply(`Available services:\n${lines.join("\n")}\n\nSend a bare IMEI/serial for ${DEFAULT_SERVICE_CODE}, or "<code> <identifier>" for a specific one.`);
+    await ctx.reply(`Available services:\n${lines.join("\n")}\n\nSend a bare IMEI/serial for ${DEFAULT_SERVICE_CODE} (or your /package default, if set), or "<code> <identifier>" for a specific one.`);
   });
 
   bot.command("history", async (ctx) => {
@@ -164,12 +201,48 @@ function getBot(): Bot {
   bot.command("settings", async (ctx) => {
     const user = await requireUser(ctx.from);
     await ctx.reply(
-      `Default service for a bare IMEI/serial is ${DEFAULT_SERVICE_CODE}. To use a different one, send "<code> <identifier>", e.g. "BLACKLIST_CHECK 356938035643809". See /services for the full list and codes.`,
+      `Default service for a bare IMEI/serial is ${DEFAULT_SERVICE_CODE}, unless you've set a standing package with /package. To use a different one just this once, send "<code> <identifier>", e.g. "BLACKLIST_CHECK 356938035643809" (a package code works here too). See /services and /package for the full lists and codes.`,
     );
     if (user && !user.phoneNumber) {
       await ctx.reply("You haven't shared a phone number yet — optional, but useful for account recovery.", {
         reply_markup: SHARE_PHONE_KEYBOARD,
       });
+    }
+  });
+
+  bot.command("package", async (ctx) => {
+    const user = await requireUser(ctx.from);
+    if (!user) return;
+
+    const arg = ctx.match?.trim();
+    if (!arg) {
+      const packages = await listActiveLookupPackages();
+      if (packages.length === 0) {
+        await ctx.reply("No packages are available right now.");
+        return;
+      }
+      const current = await getUserDefaultLookupPackage(user.id);
+      const lines = packages.map((p) => `• ${p.name} — ${p.creditCost} credit(s) (code: ${p.code})\n  ${p.services.map((s) => s.name).join(" + ")}`);
+      await ctx.reply(
+        `Available packages:\n${lines.join("\n")}\n\n` +
+          `Your current default: ${current ? current.name : "none — single-service default applies"}\n\n` +
+          'Send "/package <code>" to make one your standing default for bare IMEI/serial messages, or "/package off" to clear it.',
+      );
+      return;
+    }
+
+    if (arg.toLowerCase() === "off") {
+      await setUserDefaultLookupPackage(user.id, null);
+      await ctx.reply("Default package cleared — bare IMEI/serial messages go back to the single-service default.");
+      return;
+    }
+
+    try {
+      const code = arg.toUpperCase();
+      await setUserDefaultLookupPackage(user.id, code);
+      await ctx.reply(`Default package set to "${code}" — every bare IMEI/serial now runs this bundle until you change it.`);
+    } catch (error) {
+      await ctx.reply(error instanceof Error ? error.message : "Something went wrong.");
     }
   });
 
@@ -181,10 +254,10 @@ function getBot(): Bot {
     if (!user) return;
 
     const parts = text.split(/\s+/);
-    let serviceCode = DEFAULT_SERVICE_CODE;
+    let explicitCode: string | null = null;
     let rawIdentifier = text;
     if (parts.length >= 2 && /^[A-Z0-9_]+$/.test(parts[0] ?? "")) {
-      serviceCode = parts[0] as string;
+      explicitCode = parts[0] as string;
       rawIdentifier = parts.slice(1).join(" ");
     }
 
@@ -194,15 +267,32 @@ function getBot(): Bot {
       await ctx.reply("That doesn't look like a valid IMEI or serial number. Send just the identifier, or \"<code> <identifier>\".");
       return;
     }
+    const identifier = identifierType === "IMEI" ? normalized : rawIdentifier;
 
     try {
-      const result = await submitLookup({
-        userId: user.id,
-        identifier: identifierType === "IMEI" ? normalized : rawIdentifier,
-        identifierType,
-        serviceCode,
-        idempotencyKey: crypto.randomUUID(),
-      });
+      if (explicitCode) {
+        // Try as a package code first — packages and services are both
+        // unique, uppercase-snake identifiers, so a code is never
+        // ambiguous between the two.
+        const pkg = await prisma.lookupPackage.findUnique({ where: { code: explicitCode } });
+        if (pkg) {
+          const result = await submitPackageLookup({ userId: user.id, identifier, identifierType, packageCode: explicitCode, idempotencyKey: crypto.randomUUID() });
+          await ctx.reply(formatPackageResult(result));
+          return;
+        }
+        const result = await submitLookup({ userId: user.id, identifier, identifierType, serviceCode: explicitCode, idempotencyKey: crypto.randomUUID() });
+        await ctx.reply(formatLookupResult(result));
+        return;
+      }
+
+      const defaultPackage = await getUserDefaultLookupPackage(user.id);
+      if (defaultPackage) {
+        const result = await submitPackageLookup({ userId: user.id, identifier, identifierType, packageCode: defaultPackage.code, idempotencyKey: crypto.randomUUID() });
+        await ctx.reply(formatPackageResult(result));
+        return;
+      }
+
+      const result = await submitLookup({ userId: user.id, identifier, identifierType, serviceCode: DEFAULT_SERVICE_CODE, idempotencyKey: crypto.randomUUID() });
       await ctx.reply(formatLookupResult(result));
     } catch (error) {
       await ctx.reply(error instanceof Error ? error.message : "Something went wrong — please try again.");
