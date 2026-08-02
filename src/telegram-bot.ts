@@ -13,7 +13,7 @@ import {
   setUserDefaultLookupPackage,
   getUserDefaultLookupPackage,
 } from "@abeltib/lookup-core/workerd";
-import { isValidImei, isPlausibleSerial, normalizeImei } from "@abeltib/lookup-shared";
+import { isValidImei, isPlausibleSerial, normalizeImei, formatLookupResultFields } from "@abeltib/lookup-shared";
 
 /**
  * Chat-native front end onto the exact same lookup engine the web
@@ -60,7 +60,7 @@ function formatLookupResult(result: Awaited<ReturnType<typeof submitLookup>>): s
   }
   if (result.status === "SUCCEEDED") {
     const data = (result.resultJson ?? {}) as Record<string, unknown>;
-    const lines = Object.entries(data).map(([key, value]) => `${key}: ${value}`);
+    const lines = formatLookupResultFields(data).map((f) => `${f.label}: ${f.value}`);
     return `✅ Found (${result.creditsCharged} credit(s) charged)\n${lines.join("\n")}`;
   }
   if (result.status === "NOT_FOUND") {
@@ -80,7 +80,7 @@ function formatPackageResult(result: Awaited<ReturnType<typeof submitPackageLook
   const blocks = result.items.map((item) => {
     if (item.status === "SUCCEEDED") {
       const data = (item.resultJson ?? {}) as Record<string, unknown>;
-      const lines = Object.entries(data).map(([key, value]) => `  ${key}: ${value}`);
+      const lines = formatLookupResultFields(data).map((f) => `  ${f.label}: ${f.value}`);
       return `✅ ${item.serviceCode}\n${lines.join("\n")}`;
     }
     if (item.status === "NOT_FOUND") return `— ${item.serviceCode}: no record found`;
