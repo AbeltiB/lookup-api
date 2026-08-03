@@ -17,7 +17,7 @@ import {
   createPendingGroupCheck,
   consumePendingGroupCheck,
 } from "@abeltib/lookup-core/workerd";
-import { isValidImei, isPlausibleSerial, normalizeImei, formatLookupResultFields, type IdentifierType } from "@abeltib/lookup-shared";
+import { isValidImei, isPlausibleSerial, normalizeImei, formatLookupResultFields, AppError, type IdentifierType } from "@abeltib/lookup-shared";
 
 /**
  * Chat-native front end onto the exact same lookup engine the web
@@ -339,6 +339,32 @@ async function handleIdentifierRequest(ctx: GrammyContext, telegramFrom: Telegra
     const keyboard = delivered ? followUpKeyboard : await buildDeepLinkKeyboard(parsed, telegramFrom, telegramGroupId, telegramChatId);
     await postGroupAck(ctx, buildGroupTeaser(parsed, outcome, telegramFrom, delivered), keyboard);
   } catch (error) {
+    // Insufficient balance is the one failure mode that isn't a system
+    // error: debitCredits() rejects it *before* any provider is ever
+    // called (lookup-service.ts debits first, routes to the provider
+    // second) — so a broke/new account never costs us a provider call.
+    // It deserves its own clear, actionable message (with a deposit
+    // button) rather than the generic fallback below, which would
+    // wrongly claim credits were charged-then-refunded when nothing was
+    // ever charged.
+    if (error instanceof AppError && error.code === "INSUFFICIENT_BALANCE") {
+      const message = "⚠️ You don't have enough credits for this check.";
+      if (!isGroup) {
+        await ctx.reply(message, { reply_markup: depositKeyboard() });
+        return;
+      }
+      const delivered = await tryDm(ctx, telegramFrom.id, message, depositKeyboard());
+      const keyboard = delivered ? undefined : await buildDeepLinkKeyboard(parsed, telegramFrom, telegramGroupId, telegramChatId);
+      await postGroupAck(
+        ctx,
+        delivered
+          ? `⚠️ ${displayName(telegramFrom)}, you're out of credits for that check — check your DMs to top up.`
+          : `⚠️ ${displayName(telegramFrom)}, you're out of credits, and I couldn't DM you either.`,
+        keyboard,
+      );
+      return;
+    }
+
     // Never forward a caught error's raw .message to the user — internal/
     // provider failures can contain API error text (see postGroupAck's doc
     // comment for exactly the incident this guards against). Log the real
