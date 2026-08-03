@@ -5,6 +5,7 @@ import type { Context as HonoContext } from "hono";
 import {
   prisma,
   findOrCreateUserByTelegramId,
+  resolveTelegramGroup,
   getWalletBalance,
   getLookupHistory,
   submitLookup,
@@ -122,8 +123,12 @@ function parseIdentifierMessage(text: string): ParsedIdentifier | null {
   return null;
 }
 
-/** Runs the actual check (single service or package, explicit code or the user's standing default) — identical whether the request came from a DM or a group, only the reply/delivery mechanics differ (see handleIdentifierRequest). */
-async function runIdentifierCheck(userId: string, parsed: ParsedIdentifier): Promise<string> {
+interface ChannelContext {
+  telegramGroupId?: string;
+}
+
+/** Runs the actual check (single service or package, explicit code or the user's standing default) — identical whether the request came from a DM or a group, only the reply/delivery mechanics differ (see handleIdentifierRequest). Always tags channel "BOT" — this file is the only caller of submitLookup/submitPackageLookup that ever runs outside the web dashboard/Mini App. */
+async function runIdentifierCheck(userId: string, parsed: ParsedIdentifier, channelCtx: ChannelContext): Promise<string> {
   if (parsed.explicitCode) {
     // Try as a package code first — packages and services are both unique,
     // uppercase-snake identifiers, so a code is never ambiguous between the two.
@@ -135,6 +140,8 @@ async function runIdentifierCheck(userId: string, parsed: ParsedIdentifier): Pro
         identifierType: parsed.identifierType,
         packageCode: parsed.explicitCode,
         idempotencyKey: crypto.randomUUID(),
+        channel: "BOT",
+        telegramGroupId: channelCtx.telegramGroupId,
       });
       return formatPackageResult(result);
     }
@@ -144,6 +151,8 @@ async function runIdentifierCheck(userId: string, parsed: ParsedIdentifier): Pro
       identifierType: parsed.identifierType,
       serviceCode: parsed.explicitCode,
       idempotencyKey: crypto.randomUUID(),
+      channel: "BOT",
+      telegramGroupId: channelCtx.telegramGroupId,
     });
     return formatLookupResult(result);
   }
@@ -156,6 +165,8 @@ async function runIdentifierCheck(userId: string, parsed: ParsedIdentifier): Pro
       identifierType: parsed.identifierType,
       packageCode: defaultPackage.code,
       idempotencyKey: crypto.randomUUID(),
+      channel: "BOT",
+      telegramGroupId: channelCtx.telegramGroupId,
     });
     return formatPackageResult(result);
   }
@@ -166,6 +177,8 @@ async function runIdentifierCheck(userId: string, parsed: ParsedIdentifier): Pro
     identifierType: parsed.identifierType,
     serviceCode: DEFAULT_SERVICE_CODE,
     idempotencyKey: crypto.randomUUID(),
+    channel: "BOT",
+    telegramGroupId: channelCtx.telegramGroupId,
   });
   return formatLookupResult(result);
 }
@@ -189,11 +202,21 @@ async function handleIdentifierRequest(ctx: GrammyContext, telegramFrom: Telegra
     return;
   }
 
+  // Lazily register/refresh this group (title, last-active) and respect an
+  // admin's kill switch (Bot & Mini App page) — a disabled group is silent,
+  // same as an unrecognized message, not an error.
+  let telegramGroupId: string | undefined;
+  if (isGroup && ctx.chat) {
+    const group = await resolveTelegramGroup(String(ctx.chat.id), "title" in ctx.chat ? ctx.chat.title : "Unnamed group");
+    if (!group.isActive) return;
+    telegramGroupId = group.id;
+  }
+
   const user = await requireUser(telegramFrom);
   if (!user) return;
 
   try {
-    const replyText = await runIdentifierCheck(user.id, parsed);
+    const replyText = await runIdentifierCheck(user.id, parsed, { telegramGroupId });
     if (!isGroup) {
       await ctx.reply(replyText);
       return;
