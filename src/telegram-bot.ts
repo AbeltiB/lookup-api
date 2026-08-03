@@ -14,8 +14,10 @@ import {
   listActiveLookupPackages,
   setUserDefaultLookupPackage,
   getUserDefaultLookupPackage,
+  createPendingGroupCheck,
+  consumePendingGroupCheck,
 } from "@abeltib/lookup-core/workerd";
-import { isValidImei, isPlausibleSerial, normalizeImei, formatLookupResultFields } from "@abeltib/lookup-shared";
+import { isValidImei, isPlausibleSerial, normalizeImei, formatLookupResultFields, type IdentifierType } from "@abeltib/lookup-shared";
 
 /**
  * Chat-native front end onto the exact same lookup engine the web
@@ -25,9 +27,12 @@ import { isValidImei, isPlausibleSerial, normalizeImei, formatLookupResultFields
  * someone who's used the bot and later logs into the web (or vice versa)
  * is the same account, wallet, and history — not two.
  *
- * Buying credits isn't supported here on purpose — the bank-transfer
- * proof-of-payment flow doesn't translate to a chat interface. The bot
- * points to the web dashboard's Buy Credits page instead.
+ * Buying credits happens in the Mini App, not chat — the pick-a-package,
+ * pick-a-channel, submit-proof wizard doesn't translate to a text
+ * interface. /balance and /deposit both deep-link straight into the Mini
+ * App's /deposit page (depositKeyboard()) so it opens inside Telegram, not
+ * a browser tab; the actual verification (Verify.ET) and crediting all
+ * happen server-side in lookup-web, same as the desktop dashboard.
  *
  * Bare IMEI/serial messages run the user's standing package default
  * (User.defaultLookupPackageId, set via /package) once they've chosen
@@ -74,6 +79,11 @@ function openAppKeyboard(): InlineKeyboard {
   return new InlineKeyboard().webApp("📱 Open App", miniAppUrl());
 }
 
+/** Deep-links straight into the Mini App's deposit wizard (lookup-web's /miniapp/deposit) — package → payment channel → account details → proof submission → auto-verification, entirely inside Telegram. Replaces the old plain-browser link out to the web dashboard's /dashboard/buy-credits. */
+function depositKeyboard(): InlineKeyboard {
+  return new InlineKeyboard().webApp("💳 Deposit", `${miniAppUrl()}/deposit`);
+}
+
 type TelegramFrom = { id: number; first_name: string; last_name?: string; username?: string };
 
 function displayName(from: TelegramFrom): string {
@@ -84,11 +94,6 @@ function displayName(from: TelegramFrom): string {
 function maskIdentifier(identifier: string): string {
   if (identifier.length <= 8) return identifier;
   return `${identifier.slice(0, 4)}${"•".repeat(identifier.length - 8)}${identifier.slice(-4)}`;
-}
-
-function startChatKeyboard(): InlineKeyboard | undefined {
-  const username = process.env.TELEGRAM_BOT_USERNAME;
-  return username ? new InlineKeyboard().url("Start a chat with me", `https://t.me/${username}`) : undefined;
 }
 
 /** Best-effort DM — returns false (never throws) on the extremely common "bot can't initiate conversation with user" case, which just means this person has never opened a DM with the bot before. */
@@ -104,7 +109,7 @@ async function tryDm(ctx: GrammyContext, userId: number, text: string): Promise<
 interface ParsedIdentifier {
   explicitCode: string | null;
   identifier: string;
-  identifierType: "IMEI" | "SERIAL";
+  identifierType: IdentifierType;
 }
 
 function parseIdentifierMessage(text: string): ParsedIdentifier | null {
@@ -127,8 +132,18 @@ interface ChannelContext {
   telegramGroupId?: string;
 }
 
+/**
+ * `dmText` is the full result (DM-only). `teaserLine` is the one line safe
+ * to post in a group — a status summary, never the raw identifier or
+ * blacklist/lock details. Used to build the masked-teaser group ack.
+ */
+interface CheckOutcome {
+  dmText: string;
+  teaserLine: string;
+}
+
 /** Runs the actual check (single service or package, explicit code or the user's standing default) — identical whether the request came from a DM or a group, only the reply/delivery mechanics differ (see handleIdentifierRequest). Always tags channel "BOT" — this file is the only caller of submitLookup/submitPackageLookup that ever runs outside the web dashboard/Mini App. */
-async function runIdentifierCheck(userId: string, parsed: ParsedIdentifier, channelCtx: ChannelContext): Promise<string> {
+async function runIdentifierCheck(userId: string, parsed: ParsedIdentifier, channelCtx: ChannelContext): Promise<CheckOutcome> {
   if (parsed.explicitCode) {
     // Try as a package code first — packages and services are both unique,
     // uppercase-snake identifiers, so a code is never ambiguous between the two.
@@ -183,22 +198,87 @@ async function runIdentifierCheck(userId: string, parsed: ParsedIdentifier, chan
   return formatLookupResult(result);
 }
 
+/** Pulls a plain-text model name out of a provider's resultJson, if present — safe to show in a group (unlike the IMEI/serial or blacklist/lock fields), so it's the headline of the masked-teaser group ack. */
+function extractModel(data: Record<string, unknown>): string | undefined {
+  const raw = data.model ?? data.modelName ?? data["apple/modelName"];
+  return typeof raw === "string" && raw.trim() ? raw.trim() : undefined;
+}
+
+/**
+ * Builds the "get your result" deep link for someone the bot couldn't DM
+ * cold — creates a one-shot `PendingGroupCheck` carrying their original
+ * request, so tapping the link's `/start` re-runs *that exact check*
+ * automatically instead of asking them to retype it. Returns undefined if
+ * TELEGRAM_BOT_USERNAME isn't configured (deep links need the bot's @handle).
+ */
+async function buildDeepLinkKeyboard(
+  parsed: ParsedIdentifier,
+  telegramFrom: TelegramFrom,
+  telegramGroupId: string | undefined,
+  telegramChatId: string | undefined,
+): Promise<InlineKeyboard | undefined> {
+  const username = process.env.TELEGRAM_BOT_USERNAME;
+  if (!username) return undefined;
+  const { token } = await createPendingGroupCheck({
+    telegramUserId: String(telegramFrom.id),
+    explicitCode: parsed.explicitCode,
+    identifier: parsed.identifier,
+    identifierType: parsed.identifierType,
+    telegramGroupId,
+    telegramChatId,
+  });
+  return new InlineKeyboard().url("📩 Get my result", `https://t.me/${username}?start=${token}`);
+}
+
+/** Model shown plainly (harmless in a shared group), IMEI/serial masked — the actual report (blacklist status, lock state, etc.) never gets posted publicly, only DMed. */
+function buildGroupTeaser(parsed: ParsedIdentifier, outcome: CheckOutcome, from: TelegramFrom, delivered: boolean): string {
+  const idLabel = parsed.identifierType === "IMEI" ? "IMEI" : "Serial";
+  const lines = [
+    `🔍 Check for ${displayName(from)}`,
+    `${idLabel}: ${maskIdentifier(parsed.identifier)}`,
+    outcome.teaserLine,
+    "",
+    delivered ? "✅ Full report sent to your DM." : "⚠️ Couldn't DM you — tap below to get your result.",
+  ];
+  return lines.join("\n");
+}
+
+/**
+ * Posts the group acknowledgment in its own try/catch, deliberately
+ * isolated from the caller's error handling — this is exactly the call
+ * that was previously observed throwing ("400: Bad Request: chat not
+ * found") and, because it shared a catch block with the DM logic above it,
+ * leaking that raw Telegram API error text as a second DM to the user. A
+ * failure to post *into the group* is logged server-side only; it must
+ * never surface as a user-facing message, let alone the raw exception.
+ */
+async function postGroupAck(ctx: GrammyContext, text: string, keyboard?: InlineKeyboard): Promise<void> {
+  try {
+    await ctx.reply(text, keyboard ? { reply_markup: keyboard } : undefined);
+  } catch (error) {
+    console.error("Failed to post group acknowledgment:", error);
+  }
+}
+
 /**
  * The one place DM vs. group delivery is decided. DMs reply inline, as
  * always. In a group: never post the result itself — DM it, and leave
- * only a short, masked-identifier acknowledgment in the group (or a
- * "start a chat with me" prompt if the DM couldn't be delivered).
+ * only a masked-teaser acknowledgment in the group (model plainly shown,
+ * identifier masked), with a deep-link button if the DM couldn't be
+ * delivered.
  */
 async function handleIdentifierRequest(ctx: GrammyContext, telegramFrom: TelegramFrom, rawText: string): Promise<void> {
   const isGroup = ctx.chat?.type === "group" || ctx.chat?.type === "supergroup";
   const parsed = parseIdentifierMessage(rawText);
   if (!parsed) {
-    // In a group, silent — most group chatter isn't a check request, and
-    // replying to every unrelated message would be spam. In a DM, this is
-    // the only signal the user gets that their input wasn't understood.
-    if (!isGroup) {
-      await ctx.reply("That doesn't look like a valid IMEI or serial number. Send just the identifier, or \"<code> <identifier>\".");
-    }
+    // A group is shared, semi-public chatter — but a bare notice ("that's
+    // not a valid check") is cheap and keeps the happy path discoverable,
+    // rather than silently swallowing anything that doesn't parse.
+    await ctx.reply(
+      isGroup
+        ? "That doesn't look like an IMEI or serial number — this isn't related to a device check, so I'll leave it there. Send just the identifier, or use /check <identifier>."
+        : "That doesn't look like a valid IMEI or serial number. Send just the identifier, or \"<code> <identifier>\".",
+    );
     return;
   }
 
@@ -206,41 +286,47 @@ async function handleIdentifierRequest(ctx: GrammyContext, telegramFrom: Telegra
   // admin's kill switch (Bot & Mini App page) — a disabled group is silent,
   // same as an unrecognized message, not an error.
   let telegramGroupId: string | undefined;
+  let telegramChatId: string | undefined;
   if (isGroup && ctx.chat) {
     const group = await resolveTelegramGroup(String(ctx.chat.id), "title" in ctx.chat ? ctx.chat.title : "Unnamed group");
     if (!group.isActive) return;
     telegramGroupId = group.id;
+    telegramChatId = String(ctx.chat.id);
   }
 
   const user = await requireUser(telegramFrom);
   if (!user) return;
 
   try {
-    const replyText = await runIdentifierCheck(user.id, parsed, { telegramGroupId });
+    const outcome = await runIdentifierCheck(user.id, parsed, { telegramGroupId });
     if (!isGroup) {
-      await ctx.reply(replyText);
+      await ctx.reply(outcome.dmText);
       return;
     }
 
-    const delivered = await tryDm(ctx, telegramFrom.id, replyText);
-    await ctx.reply(
-      delivered
-        ? `🔍 Checked ${maskIdentifier(parsed.identifier)} for ${displayName(telegramFrom)} — result sent to your DMs.`
-        : `⚠️ ${displayName(telegramFrom)}, I checked ${maskIdentifier(parsed.identifier)} but couldn't DM you the result — please start a chat with me first, then try again.`,
-      delivered ? undefined : { reply_markup: startChatKeyboard() },
-    );
+    const delivered = await tryDm(ctx, telegramFrom.id, outcome.dmText);
+    const keyboard = delivered ? undefined : await buildDeepLinkKeyboard(parsed, telegramFrom, telegramGroupId, telegramChatId);
+    await postGroupAck(ctx, buildGroupTeaser(parsed, outcome, telegramFrom, delivered), keyboard);
   } catch (error) {
-    const message = error instanceof Error ? error.message : "Something went wrong — please try again.";
+    // Never forward a caught error's raw .message to the user — internal/
+    // provider failures can contain API error text (see postGroupAck's doc
+    // comment for exactly the incident this guards against). Log the real
+    // error server-side (visible via `wrangler tail`) and show a generic,
+    // friendly fallback instead.
+    console.error("handleIdentifierRequest failed:", error);
+    const friendly = "❌ That check couldn't be completed — any credits charged were refunded. Please try again in a moment.";
     if (!isGroup) {
-      await ctx.reply(message);
+      await ctx.reply(friendly);
       return;
     }
-    const delivered = await tryDm(ctx, telegramFrom.id, `❌ ${message}`);
-    await ctx.reply(
+    const delivered = await tryDm(ctx, telegramFrom.id, friendly);
+    const keyboard = delivered ? undefined : await buildDeepLinkKeyboard(parsed, telegramFrom, telegramGroupId, telegramChatId);
+    await postGroupAck(
+      ctx,
       delivered
         ? `⚠️ ${displayName(telegramFrom)}, that check couldn't be completed — details sent to your DMs.`
-        : `⚠️ ${displayName(telegramFrom)}, that check couldn't be completed, and I couldn't DM you either — please start a chat with me first.`,
-      delivered ? undefined : { reply_markup: startChatKeyboard() },
+        : `⚠️ ${displayName(telegramFrom)}, that check couldn't be completed, and I couldn't DM you either.`,
+      keyboard,
     );
   }
 }
@@ -255,27 +341,43 @@ async function requireUser(telegramFrom: { id: number; first_name: string; last_
   return user;
 }
 
-function formatLookupResult(result: Awaited<ReturnType<typeof submitLookup>>): string {
+function formatLookupResult(result: Awaited<ReturnType<typeof submitLookup>>): CheckOutcome {
   if (result.status === "PROCESSING") {
-    return "Still checking with the provider — this one's taking a little longer. I'll have an answer soon; check /history shortly.";
+    return {
+      dmText: "Still checking with the provider — this one's taking a little longer. I'll have an answer soon; check /history shortly.",
+      teaserLine: "⏳ Still checking",
+    };
   }
   if (result.status === "SUCCEEDED") {
     const data = (result.resultJson ?? {}) as Record<string, unknown>;
     const lines = formatLookupResultFields(data).map((f) => `${f.label}: ${f.value}`);
-    return `✅ Found (${result.creditsCharged} credit(s) charged)\n${lines.join("\n")}`;
+    const model = extractModel(data);
+    return {
+      dmText: `✅ Found (${result.creditsCharged} credit(s) charged)\n${lines.join("\n")}`,
+      teaserLine: model ? `📱 ${model}` : "✅ Found",
+    };
   }
   if (result.status === "NOT_FOUND") {
-    return `No record found (${result.creditsCharged} credit(s) charged).`;
+    return { dmText: `No record found (${result.creditsCharged} credit(s) charged).`, teaserLine: "No record found" };
   }
-  return `❌ ${result.errorMessage ?? "That check failed — any credits charged were refunded."}`;
+  return {
+    dmText: `❌ ${result.errorMessage ?? "That check failed — any credits charged were refunded."}`,
+    teaserLine: "❌ Check failed",
+  };
 }
 
-function formatPackageResult(result: Awaited<ReturnType<typeof submitPackageLookup>>): string {
+function formatPackageResult(result: Awaited<ReturnType<typeof submitPackageLookup>>): CheckOutcome {
   if (result.status === "PROCESSING") {
-    return `Still checking with the provider on part of "${result.packageName}" — I'll have a full answer soon; check /history shortly.`;
+    return {
+      dmText: `Still checking with the provider on part of "${result.packageName}" — I'll have a full answer soon; check /history shortly.`,
+      teaserLine: "⏳ Still checking",
+    };
   }
   if (result.status === "FAILED") {
-    return `❌ "${result.packageName}" couldn't be completed — any credits charged were refunded.`;
+    return {
+      dmText: `❌ "${result.packageName}" couldn't be completed — any credits charged were refunded.`,
+      teaserLine: "❌ Check failed",
+    };
   }
 
   const blocks = result.items.map((item) => {
@@ -289,7 +391,13 @@ function formatPackageResult(result: Awaited<ReturnType<typeof submitPackageLook
     return `❌ ${item.serviceCode}: ${item.errorMessage ?? "failed"}`;
   });
 
-  return `📦 ${result.packageName} (${result.creditsCharged} credit(s) charged)\n\n${blocks.join("\n\n")}`;
+  const firstSuccess = result.items.find((item) => item.status === "SUCCEEDED");
+  const model = firstSuccess ? extractModel((firstSuccess.resultJson ?? {}) as Record<string, unknown>) : undefined;
+
+  return {
+    dmText: `📦 ${result.packageName} (${result.creditsCharged} credit(s) charged)\n\n${blocks.join("\n\n")}`,
+    teaserLine: model ? `📱 ${model}` : "✅ Found",
+  };
 }
 
 let bot: Bot | undefined;
@@ -319,6 +427,40 @@ function getBot(): Bot {
     // oauth.telegram.org fallback. A bare /start (organic bot discovery)
     // has an empty match and falls through to the normal welcome message.
     const loginToken = ctx.match?.trim();
+    if (loginToken?.startsWith("chk_")) {
+      // The "smoother onboarding" path: someone in a group whose DM
+      // couldn't be delivered cold tapped the deep-link button instead of
+      // being told to go start a chat and retype their IMEI. Their
+      // original request travelled inside the token (PendingGroupCheck) —
+      // fulfilling it here means this /start *is* their check, no
+      // re-typing needed.
+      const consumed = await consumePendingGroupCheck(loginToken, String(telegramFrom.id));
+      if (!consumed) {
+        await ctx.reply("That link has expired or was already used — please send your IMEI or serial again in the group.");
+        return;
+      }
+      const parsed: ParsedIdentifier = {
+        explicitCode: consumed.explicitCode,
+        identifier: consumed.identifier,
+        identifierType: consumed.identifierType,
+      };
+      try {
+        const outcome = await runIdentifierCheck(user.id, parsed, { telegramGroupId: consumed.telegramGroupId ?? undefined });
+        await ctx.reply(`Thanks for starting a chat — here's your result:\n\n${outcome.dmText}`);
+        if (consumed.telegramChatId) {
+          try {
+            await ctx.api.sendMessage(consumed.telegramChatId, `✅ ${displayName(telegramFrom)}, I sent your result — check your DMs!`);
+          } catch (error) {
+            console.error("Failed to post group follow-up:", error);
+          }
+        }
+      } catch (error) {
+        console.error("Deep-link check failed:", error);
+        await ctx.reply("❌ That check couldn't be completed — any credits charged were refunded. Please try again.");
+      }
+      return;
+    }
+
     if (loginToken) {
       const confirmed = await confirmTelegramLoginSession(loginToken, {
         telegramId: String(telegramFrom.id),
@@ -339,6 +481,7 @@ function getBot(): Bot {
         "/services — see what's available and their codes\n" +
         "/package — bundle several checks into one report\n" +
         "/balance — your credit balance\n" +
+        "/deposit — add credits (TeleBirr, bank transfer, and more)\n" +
         "/history — your last few checks\n" +
         "/settings — how to pick a specific service per check",
       { reply_markup: openAppKeyboard() },
@@ -381,7 +524,16 @@ function getBot(): Bot {
     const user = await requireUser(ctx.from);
     if (!user) return;
     const balance = await getWalletBalance(user.id);
-    await ctx.reply(`Your balance: ${balance} credits.\nTop up: ${webAppUrl()}/dashboard/buy-credits`);
+    await ctx.reply(`Your balance: ${balance} credits.`, { reply_markup: depositKeyboard() });
+  });
+
+  bot.command("deposit", async (ctx) => {
+    const user = await requireUser(ctx.from);
+    if (!user) return;
+    await ctx.reply(
+      "Top up your balance — pick a package and a payment channel (TeleBirr, CBE, and others), get the account to pay, and submit your reference number, a screenshot, or the confirmation SMS. Verified automatically, credits added the moment it clears:",
+      { reply_markup: depositKeyboard() },
+    );
   });
 
   bot.command("services", async (ctx) => {
