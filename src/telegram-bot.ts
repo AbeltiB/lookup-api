@@ -542,13 +542,28 @@ function getBot(): Bot {
       });
       return;
     }
-    await findOrCreateUserByTelegramId(String(ctx.from.id), {
-      firstName: ctx.from.first_name,
-      lastName: ctx.from.last_name,
-      username: ctx.from.username,
-      phoneNumber: contact.phone_number,
-    });
-    await ctx.reply("Got it, thanks — your phone number is saved.", { reply_markup: { remove_keyboard: true } });
+    try {
+      await findOrCreateUserByTelegramId(String(ctx.from.id), {
+        firstName: ctx.from.first_name,
+        lastName: ctx.from.last_name,
+        username: ctx.from.username,
+        phoneNumber: contact.phone_number,
+      });
+      await ctx.reply("Got it, thanks — your phone number is saved.", { reply_markup: { remove_keyboard: true } });
+    } catch (error) {
+      // Phone numbers are unique across accounts (one real number can't
+      // back two accounts, e.g. switching Telegram accounts on the same
+      // phone and re-sharing the same contact) — a friendly message here
+      // instead of letting a raw DB constraint error vanish silently.
+      const isDuplicatePhone = error instanceof Error && "code" in error && (error as { code?: string }).code === "P2002";
+      console.error("Failed to save shared phone number:", error);
+      await ctx.reply(
+        isDuplicatePhone
+          ? "That phone number is already linked to a different account — each number can only back one account."
+          : "Couldn't save your phone number — please try again.",
+        { reply_markup: { remove_keyboard: true } },
+      );
+    }
   });
 
   bot.command("balance", async (ctx) => {
