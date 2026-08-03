@@ -97,13 +97,43 @@ function maskIdentifier(identifier: string): string {
 }
 
 /** Best-effort DM — returns false (never throws) on the extremely common "bot can't initiate conversation with user" case, which just means this person has never opened a DM with the bot before. */
-async function tryDm(ctx: GrammyContext, userId: number, text: string): Promise<boolean> {
+async function tryDm(ctx: GrammyContext, userId: number, text: string, keyboard?: InlineKeyboard): Promise<boolean> {
   try {
-    await ctx.api.sendMessage(userId, text);
+    await ctx.api.sendMessage(userId, text, keyboard ? { reply_markup: keyboard } : undefined);
     return true;
   } catch {
     return false;
   }
+}
+
+/**
+ * One-tap alternates attached to every result (DM and group ack alike) —
+ * SIM Lock + Carrier, Activation, and MDM Lock are common enough follow-up
+ * checks that retyping "<CODE> <identifier>" is friction worth removing.
+ * Encodes as `chk:<serviceCode>:<identifier>` in callback_data (well under
+ * Telegram's 64-byte limit for every code here) — the callback_query
+ * handler below reconstructs the same "<CODE> <identifier>" text these
+ * buttons are a shortcut for and feeds it straight back through
+ * handleIdentifierRequest, so DM/group delivery, credits, rate limiting,
+ * and group kill-switch behavior are all identical to typing it by hand.
+ */
+const SERVICE_BUTTONS: { label: string; code: string }[] = [
+  { label: "🔒 SIM Lock + Carrier", code: "CARRIER_SIM_LOCK_ONLY_255" },
+  { label: "✅ Activation Status", code: "ACTIVATION_CHECK_131" },
+  { label: "🔐 MDM Lock", code: "MDM_ON_OFF_STATUS_S1_204" },
+];
+
+/** Omits whichever of the three the just-run check already was — no point offering "MDM Lock" as a follow-up on a result that's already the MDM Lock check. Returns undefined once nothing's left to offer. */
+function serviceButtonsKeyboard(identifier: string, justRanCode: string | null): InlineKeyboard | undefined {
+  const remaining = SERVICE_BUTTONS.filter((b) => b.code !== justRanCode);
+  if (remaining.length === 0) return undefined;
+
+  const keyboard = new InlineKeyboard();
+  remaining.forEach((b, i) => {
+    if (i > 0) keyboard.row();
+    keyboard.text(b.label, `chk:${b.code}:${identifier}`);
+  });
+  return keyboard;
 }
 
 interface ParsedIdentifier {
@@ -299,13 +329,14 @@ async function handleIdentifierRequest(ctx: GrammyContext, telegramFrom: Telegra
 
   try {
     const outcome = await runIdentifierCheck(user.id, parsed, { telegramGroupId });
+    const followUpKeyboard = serviceButtonsKeyboard(parsed.identifier, parsed.explicitCode);
     if (!isGroup) {
-      await ctx.reply(outcome.dmText);
+      await ctx.reply(outcome.dmText, followUpKeyboard ? { reply_markup: followUpKeyboard } : undefined);
       return;
     }
 
-    const delivered = await tryDm(ctx, telegramFrom.id, outcome.dmText);
-    const keyboard = delivered ? undefined : await buildDeepLinkKeyboard(parsed, telegramFrom, telegramGroupId, telegramChatId);
+    const delivered = await tryDm(ctx, telegramFrom.id, outcome.dmText, followUpKeyboard);
+    const keyboard = delivered ? followUpKeyboard : await buildDeepLinkKeyboard(parsed, telegramFrom, telegramGroupId, telegramChatId);
     await postGroupAck(ctx, buildGroupTeaser(parsed, outcome, telegramFrom, delivered), keyboard);
   } catch (error) {
     // Never forward a caught error's raw .message to the user — internal/
@@ -630,6 +661,31 @@ function getBot(): Bot {
     const telegramFrom = ctx.from;
     if (!telegramFrom) return;
     await handleIdentifierRequest(ctx, telegramFrom, text);
+  });
+
+  // The one-tap follow-up buttons attached to every result (see
+  // serviceButtonsKeyboard) — reconstructs the same "<CODE> <identifier>"
+  // text those buttons are shorthand for and feeds it through the exact
+  // same path a typed message takes, so DM/group delivery, credits, rate
+  // limiting, and the group kill-switch all behave identically to typing
+  // it by hand. Works for anyone in the group who taps it, not just the
+  // original sender — each tap runs (and charges) under whoever tapped.
+  bot.on("callback_query:data", async (ctx) => {
+    const data = ctx.callbackQuery.data;
+    if (!data.startsWith("chk:")) return;
+
+    await ctx.answerCallbackQuery(); // dismiss the tap's loading spinner immediately; the result arrives as a new message once the check finishes
+
+    const telegramFrom = ctx.from;
+    if (!telegramFrom) return;
+
+    const rest = data.slice(4);
+    const separatorIndex = rest.indexOf(":");
+    if (separatorIndex < 0) return;
+    const code = rest.slice(0, separatorIndex);
+    const identifier = rest.slice(separatorIndex + 1);
+
+    await handleIdentifierRequest(ctx, telegramFrom, `${code} ${identifier}`);
   });
 
   return bot;
