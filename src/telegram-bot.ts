@@ -348,13 +348,24 @@ async function handleIdentifierRequest(ctx: GrammyContext, telegramFrom: Telegra
     // wrongly claim credits were charged-then-refunded when nothing was
     // ever charged.
     if (error instanceof AppError && error.code === "INSUFFICIENT_BALANCE") {
-      const message = "⚠️ You don't have enough credits for this check.";
       if (!isGroup) {
-        await ctx.reply(message, { reply_markup: depositKeyboard() });
+        await ctx.reply("⚠️ You don't have enough credits for this check.", { reply_markup: depositKeyboard() });
         return;
       }
-      const delivered = await tryDm(ctx, telegramFrom.id, message, depositKeyboard());
-      const keyboard = delivered ? undefined : await buildDeepLinkKeyboard(parsed, telegramFrom, telegramGroupId, telegramChatId);
+
+      // Always (re-)create a PendingGroupCheck here — not just when the DM
+      // fails — so this exact request can auto-resume the instant a
+      // deposit clears (see lookup-web's payment-verification.ts resume
+      // hook, consumeOldestPendingGroupCheckForResume). Doubles as the
+      // "reach a DM" deep link if the DM below can't be delivered.
+      const deepLinkKeyboard = await buildDeepLinkKeyboard(parsed, telegramFrom, telegramGroupId, telegramChatId);
+      const delivered = await tryDm(
+        ctx,
+        telegramFrom.id,
+        "⚠️ You don't have enough credits for this check.\n\nAdd credits below and I'll run this automatically the moment your deposit clears — no need to resend it.",
+        depositKeyboard(),
+      );
+      const keyboard = delivered ? undefined : deepLinkKeyboard;
       await postGroupAck(
         ctx,
         delivered
@@ -512,6 +523,25 @@ function getBot(): Bot {
           }
         }
       } catch (error) {
+        if (error instanceof AppError && error.code === "INSUFFICIENT_BALANCE") {
+          // Still no credits after resuming — the just-consumed token is
+          // now dead, so re-create a fresh PendingGroupCheck (same
+          // request) purely so the deposit-resume hook still has
+          // something to find once they top up.
+          await createPendingGroupCheck({
+            telegramUserId: String(telegramFrom.id),
+            explicitCode: parsed.explicitCode,
+            identifier: parsed.identifier,
+            identifierType: parsed.identifierType,
+            telegramGroupId: consumed.telegramGroupId ?? undefined,
+            telegramChatId: consumed.telegramChatId ?? undefined,
+          });
+          await ctx.reply(
+            "⚠️ You still don't have enough credits for this check.\n\nAdd credits below and I'll run it automatically the moment your deposit clears — no need to resend it.",
+            { reply_markup: depositKeyboard() },
+          );
+          return;
+        }
         console.error("Deep-link check failed:", error);
         await ctx.reply("❌ That check couldn't be completed — any credits charged were refunded. Please try again.");
       }
