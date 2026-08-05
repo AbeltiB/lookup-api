@@ -16,6 +16,7 @@ import {
   getUserDefaultLookupPackage,
   createPendingGroupCheck,
   consumePendingGroupCheck,
+  isInternalTelegramUser,
 } from "@abeltib/lookup-core/workerd";
 import { isValidImei, isPlausibleSerial, normalizeImei, formatLookupResultFields, AppError, type IdentifierType } from "@abeltib/lookup-shared";
 
@@ -327,6 +328,25 @@ async function handleIdentifierRequest(ctx: GrammyContext, telegramFrom: Telegra
   const user = await requireUser(telegramFrom);
   if (!user) return;
 
+  // DM checks are funneled into the group by design (admin-configured, see
+  // /dashboard/admin/bot's group list "Primary" control) — internal/admin
+  // accounts (InternalUser allowlist) stay exempt so testing via DM still
+  // works. Only activates once an admin has actually set a primary group
+  // with a real invite link; until then DMs behave exactly as before, so
+  // this can never dead-end someone on a half-configured feature.
+  if (!isGroup) {
+    const exempt = await isInternalTelegramUser(user.id);
+    if (!exempt) {
+      const primaryGroup = await prisma.telegramGroup.findFirst({ where: { isPrimary: true } });
+      if (primaryGroup?.inviteLink) {
+        await ctx.reply("📵 IMEI/serial checks are only available in our group — tap below to join, then send it there.", {
+          reply_markup: new InlineKeyboard().url("👥 Join the group", primaryGroup.inviteLink),
+        });
+        return;
+      }
+    }
+  }
+
   try {
     const outcome = await runIdentifierCheck(user.id, parsed, { telegramGroupId });
     const followUpKeyboard = serviceButtonsKeyboard(parsed.identifier, parsed.explicitCode);
@@ -563,15 +583,26 @@ function getBot(): Bot {
       return;
     }
 
+    const primaryGroup = await prisma.telegramGroup.findFirst({ where: { isPrimary: true } });
+    const checksRedirectToGroup = Boolean(primaryGroup?.inviteLink) && !(await isInternalTelegramUser(user.id));
+
     await ctx.reply(
-      `Welcome to DeviceIQ, ${user.name}!\n\nSend me an IMEI or serial number to check it, or open the app below for a full dashboard — balance, services, history, and deposits.\n\n` +
+      `Welcome to DeviceIQ, ${user.name}!\n\n` +
+        (checksRedirectToGroup
+          ? `IMEI/serial checks happen in our group — join and send it there. Everything else (balance, services, history, deposits) is right here or in the app below.\n\n`
+          : `Send me an IMEI or serial number to check it, or open the app below for a full dashboard — balance, services, history, and deposits.\n\n`) +
         "/services — see what's available and their codes\n" +
         "/package — bundle several checks into one report\n" +
         "/balance — your credit balance\n" +
         "/deposit — add credits (TeleBirr, bank transfer, and more)\n" +
         "/history — your last few checks\n" +
         "/settings — how to pick a specific service per check",
-      { reply_markup: openAppKeyboard() },
+      {
+        reply_markup:
+          checksRedirectToGroup && primaryGroup?.inviteLink
+            ? new InlineKeyboard().url("👥 Join the group", primaryGroup.inviteLink).webApp("📱 Open App", miniAppUrl())
+            : openAppKeyboard(),
+      },
     );
 
     if (!user.phoneNumber) {
