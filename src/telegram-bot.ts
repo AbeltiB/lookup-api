@@ -356,7 +356,12 @@ async function handleIdentifierRequest(ctx: GrammyContext, telegramFrom: Telegra
     }
 
     const delivered = await tryDm(ctx, telegramFrom.id, outcome.dmText, followUpKeyboard);
-    const keyboard = delivered ? followUpKeyboard : await buildDeepLinkKeyboard(parsed, telegramFrom, telegramGroupId, telegramChatId);
+    // Service follow-up buttons (SIM Lock+Carrier/Activation/MDM Lock) are a
+    // DM-only convenience — the group teaser is just a masked preview, so it
+    // stays button-free once the DM lands. If the DM couldn't be delivered,
+    // the deep-link button is not a "preview" convenience but the only way
+    // left to reach the result at all, so it still appears.
+    const keyboard = delivered ? undefined : await buildDeepLinkKeyboard(parsed, telegramFrom, telegramGroupId, telegramChatId);
     await postGroupAck(ctx, buildGroupTeaser(parsed, outcome, telegramFrom, delivered), keyboard);
   } catch (error) {
     // Insufficient balance is the one failure mode that isn't a system
